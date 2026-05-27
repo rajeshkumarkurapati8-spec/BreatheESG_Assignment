@@ -1,0 +1,9 @@
+Werk,Brennstoffart,Menge,Einheit,Buchungsdatum
+DE01,Dieselkraftstoff,1250.5,L,15.03.2024
+DE02,Benzin,48,gallon,03/15/2024
+DE99,Heizöl,320,L,2024-03-20
+UNKNOWN,Diesel,90,L,01.02.2024
+PL01,Dieselkraftstoff,-50,L,10.01.2024
+NL01,Benzin,200,L,not-a-date
+,Heizöl,75,L,05.06.2024
+FR01,Diesel,1500,m3,28.02.2024

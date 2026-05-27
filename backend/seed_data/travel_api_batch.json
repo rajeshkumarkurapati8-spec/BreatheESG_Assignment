@@ -1,0 +1,50 @@
+{
+  "batch_id": "CONCUR-2024-Q2-001",
+  "trips": [
+    {
+      "employee_id": "E10293",
+      "trip_type": "air",
+      "departure_airport": "FRA",
+      "arrival_airport": "LHR",
+      "hotel_nights": 0,
+      "taxi_distance_km": 0,
+      "trip_date": "2024-04-12"
+    },
+    {
+      "employee_id": "E10441",
+      "trip_type": "mixed",
+      "departure_airport": "MUC",
+      "arrival_airport": "JFK",
+      "hotel_nights": 3,
+      "taxi_distance_km": 45,
+      "trip_date": "15.05.2024"
+    },
+    {
+      "employee_id": "E10880",
+      "trip_type": "hotel",
+      "departure_airport": "",
+      "arrival_airport": "",
+      "hotel_nights": 2,
+      "taxi_distance_km": 0,
+      "trip_date": "2024-06-01"
+    },
+    {
+      "employee_id": "E10999",
+      "trip_type": "air",
+      "departure_airport": "BER",
+      "arrival_airport": "ZZZ",
+      "hotel_nights": 0,
+      "taxi_distance_km": 0,
+      "trip_date": "2024-06-15"
+    },
+    {
+      "employee_id": "E11001",
+      "trip_type": "ground",
+      "departure_airport": "",
+      "arrival_airport": "",
+      "hotel_nights": 0,
+      "taxi_distance_km": 28.5,
+      "trip_date": "2024-06-20"
+    }
+  ]
+}
