@@ -9,6 +9,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+try:
+    import dj_database_url
+except ImportError:
+    dj_database_url = None
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-insecure-key-change-in-production")
@@ -43,6 +48,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -74,33 +80,14 @@ ASGI_APPLICATION = "config.asgi.application"
 
 # Database — PostgreSQL via DATABASE_URL; SQLite fallback for local dev without Postgres
 _database_url = os.environ.get("DATABASE_URL")
-if _database_url:
-    # Render/Heroku style: postgres://...
-    import re
-
-    match = re.match(
-        r"postgres(?:ql)?://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)",
-        _database_url,
-    )
-    if match:
-        user, password, host, port, name = match.groups()
-        DATABASES = {
-            "default": {
-                "ENGINE": "django.db.backends.postgresql",
-                "NAME": name.split("?")[0],
-                "USER": user,
-                "PASSWORD": password,
-                "HOST": host,
-                "PORT": port,
-            }
-        }
-    else:
-        DATABASES = {
-            "default": {
-                "ENGINE": "django.db.backends.sqlite3",
-                "NAME": BASE_DIR / "db.sqlite3",
-            }
-        }
+if _database_url and dj_database_url:
+    DATABASES = {
+        "default": dj_database_url.parse(
+            _database_url,
+            conn_max_age=600,
+            ssl_require=True,
+        )
+    }
 else:
     DATABASES = {
         "default": {
@@ -125,6 +112,7 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
 
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"

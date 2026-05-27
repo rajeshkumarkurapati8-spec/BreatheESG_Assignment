@@ -1,0 +1,8 @@
+{
+  "employee_id": "EMP001",
+  "trip_type": "flight",
+  "departure_airport": "JFK",
+  "arrival_airport": "LAX",
+  "hotel_nights": 2,
+  "taxi_distance_km": 15
+}
