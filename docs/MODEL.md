@@ -1,223 +1,223 @@
-# Data Model
+﻿# Data Model
 
-This document explains the domain model for the ESG emissions ingestion and analyst review platform. Implementation lives under `backend/` across five Django apps.
+This document describes the model and architecture decisions for the ESG emissions ingestion and analyst review platform.
 
----
-
-## Entity relationship overview
-
-```
-Tenant ─────────────┬──────────── DataSource ──── RawRecord
-    │               │                  │              │
-    │               │                  │              │ 1:1 (when normalized)
-    │               └──── User         │              ▼
-    │                    (uploaded_by)│     NormalizedEmissionRecord
-    │                                   │              │
-    └───────────────────────────────────┴──────────────┘
-                                                    │
-                              reviewed_by ──────────┤
-                                                    │
-AuditLog (entity_type + entity_id) ─── polymorphic reference, no FK
-
-PlantCodeLookup — standalone reference (SAP Werk → plant name)
-```
+It is written from the perspective of a backend engineer defending the design in a technical review, with emphasis on tenant safety, traceability, and review semantics.
 
 ---
 
 ## Multi-tenancy
 
-**Pattern:** Shared PostgreSQL database, **row-level** isolation.
+The platform uses a shared database and enforces tenant boundaries through explicit row-level scoping.
 
-| Model | Tenant FK | Notes |
-|-------|-----------|-------|
-| `Tenant` | — | Root entity |
-| `User` | optional | Null only for Django superuser |
-| `DataSource` | required | Uploads scoped to company |
-| `RawRecord` | via `data_source` | Inherited scope |
-| `NormalizedEmissionRecord` | required | Denormalized for query performance |
-| `AuditLog` | — | `performed_by` links to user (who has tenant) |
-| `PlantCodeLookup` | — | **Global** reference data (same SAP codes across clients in MVP) |
+- `Tenant` is the root company/entity.
+- `User` belongs to a tenant or is a null-tenant superuser.
+- `DataSource` belongs to a tenant and represents one ingestion batch.
+- `RawRecord` inherits tenant scope through `data_source`.
+- `NormalizedEmissionRecord` stores tenant directly for fast review and query performance.
 
-**Why duplicate `tenant` on `NormalizedEmissionRecord`:** Review queue and dashboard queries filter by tenant without joining through `raw_record → data_source`. In production you might enforce consistency with DB constraints or triggers; MVP relies on service layer always setting tenant from `DataSource`.
+### Why tenant on normalized records?
 
-**Enforcement (Phase 4):** DRF permissions filter querysets with `request.user.tenant_id`. Clients never pass arbitrary `tenant_id` on create.
+Normalized rows are the review and reporting surface. If tenant filtering required joining from `NormalizedEmissionRecord → RawRecord → DataSource`, review queries would be heavier and more error-prone.
 
----
+Storing tenant on normalized records is a deliberate redundancy for safety and performance. The service layer must set the tenant consistently from the source batch.
 
-## Core entities
+### Enforcement strategy
 
-### Tenant
+Tenant isolation is enforced in the request/permission layer. Review and listing endpoints filter by `request.user.tenant`, and approval/rejection lookups explicitly require the record to belong to the analyst's tenant.
 
-Represents one reporting company.
-
-| Field | Purpose |
-|-------|---------|
-| `company_name` | Display / legal name |
-| `industry` | Context for benchmarks (not heavily used in MVP) |
-| `created_at` | Onboarding audit |
-
-### User (`AUTH_USER_MODEL`)
-
-Extends Django `AbstractUser`.
-
-| Field | Purpose |
-|-------|---------|
-| `tenant` | Company membership |
-| `is_analyst` | Can approve/reject records |
-| `is_uploader` | Can POST uploads |
-
-MVP uses coarse flags instead of a permission matrix — sufficient for demo, document as simplification.
+This is a practical MVP choice: it avoids complex DB-level multi-tenant routing while preserving isolation in the application layer.
 
 ---
 
-## Source tracking
+## Source-of-truth tracking
 
 ### DataSource
 
-One **ingestion run**: a CSV file or mocked API batch.
+`DataSource` represents one upload or API batch. It is the operational unit of ingestion.
 
-| Field | Purpose |
-|-------|---------|
-| `source_type` | `sap_fuel`, `utility_electricity`, `corporate_travel` — selects parser |
-| `ingestion_method` | `csv_upload` or `api_mock` |
-| `original_filename` | Audit trail for file-based sources |
-| `uploaded_by` / `uploaded_at` | Who submitted and when |
-| `processing_status` | `pending` → `processing` → `completed` / `failed` |
-| `processing_summary` | JSON row counts, error totals (set by pipeline) |
+Fields of note:
 
-**Design intent:** Analysts and auditors can answer “what file produced these numbers?” without digging in object storage.
+- `source_type` selects parser behavior.
+- `ingestion_method` distinguishes CSV upload from API mock.
+- `original_filename` records the source artifact for audit.
+- `uploaded_by` and `uploaded_at` record actor and time.
+- `processing_status` tracks pipeline progress.
+- `processing_summary` stores row counts and pipeline outcomes.
+
+This object is the trace anchor for the ingest path. If a reconciliation question arises, `DataSource` answers “which file/batch and who submitted it?”.
 
 ### RawRecord
 
-**Immutable capture** of one source row.
+`RawRecord` stores the original parsed payload and row metadata.
 
-| Field | Purpose |
-|-------|---------|
-| `raw_payload` | Exact parsed fields (German SAP headers preserved in JSON keys) |
-| `row_number` | 1-based index; unique per `data_source` |
-| `validation_errors` | List of strings; empty means structurally valid |
+Key properties:
 
-**Why keep invalid rows:** Failed validation still stored so analysts can see what the company sent and fix upstream exports.
+- `raw_payload` preserves the exact submitted fields.
+- `row_number` provides stable source-row identity within the batch.
+- `validation_errors` keeps parsing and structural failures.
 
-**Normalization link:** `NormalizedEmissionRecord.raw_record` is `OneToOneField` — at most one canonical line per raw row.
+Raw records are intentionally retained even when validation fails.
+That means the system does not lose the original source row just because it failed normalization.
+
+**Why RawRecord exists:** it is the source-of-truth for ingestion. It separates the original input from derived emissions data.
 
 ---
 
-## Normalized emissions domain
+## Normalization strategy
+
+The model separates raw ingestion from canonical emissions records.
 
 ### NormalizedEmissionRecord
 
-Canonical line after validation, unit conversion, and emission calculation.
+A normalized record is the first trusted emissions line after:
 
-| Field | Purpose |
-|-------|---------|
-| `emission_scope` | `scope1`, `scope2`, `scope3` (GHG Protocol aligned labels) |
-| `category` | Finer bucket: e.g. `stationary_combustion`, `purchased_electricity`, `business_travel_air` |
-| `activity_date` | When activity occurred (or utility billing midpoint) |
-| `normalized_unit` / `normalized_quantity` | Standardized activity data (liters, kWh, km) |
-| `emission_factor` | Factor **at time of calculation** (snapshot for audit) |
-| `calculated_emissions_kg_co2e` | `quantity × factor` |
-| `source_system` | e.g. `sap_mm`, `utility_portal`, `concur_mock` |
-| `suspicious_flag` / `suspicious_reason` | Rule engine output (e.g. utility spike) |
-| `approval_status` | `pending`, `approved`, `rejected` |
-| `locked_for_audit` | `True` → no edits (set on approve in Phase 3) |
-| `reviewed_by` / `reviewed_at` | Analyst accountability |
+1. validation
+2. unit conversion
+3. date normalization
+4. factor resolution
+5. emissions calculation
 
-**Indexes:** `(tenant, approval_status, suspicious_flag)` optimizes review queue; `(tenant, emission_scope)` for dashboard breakdown.
+Important stored fields:
 
-### PlantCodeLookup
+- `emission_scope` (`scope1` / `scope2` / `scope3`)
+- `category` (business domain bucket)
+- `normalized_unit` / `normalized_quantity`
+- `emission_factor` snapshot
+- `calculated_emissions_kg_co2e`
+- `source_system`
+- `suspicious_flag` / `suspicious_reason`
+- `approval_status`
+- `locked_for_audit`
 
-Maps SAP `Werk` codes to facility metadata.
+### Why normalized records are separated
 
-| Field | Purpose |
-|-------|---------|
-| `code` (PK) | SAP plant code |
-| `plant_name` | Resolved name |
-| `country` | ISO-2 for regional factors (future) |
+Raw ingestion and reporting are separate concerns.
 
-Includes `UNKNOWN` fallback so ingestion never hard-fails on unmapped plants — flags for analyst review instead.
+- `RawRecord` is about what was submitted.
+- `NormalizedEmissionRecord` is about what the system accepted for emissions accounting.
 
-**Global table:** Shared across tenants in MVP. Multi-tenant plant registries would be a v2 feature.
+This avoids exposing parser internals through the review API and enables an audit trail from source payload to approved emission line.
+
+---
+
+## Suspicious record handling
+
+The model supports suspicious scoring directly on normalized records.
+
+- `suspicious_flag` is a boolean rule output.
+- `suspicious_reason` stores analyst-facing explanation.
+
+The rule engine in the ingestion layer can mark records without blocking them. For example, utility electricity rows can be accepted while still flagged when usage exceeds twice the rolling average for the same meter.
+
+This is deliberate: suspicious handling is advisory during review, not a hard ingestion failure.
+
+---
+
+## Review workflow
+
+The `review` app is intentionally model-free. Review behavior is implemented in services.
+
+### Flow
+
+- analyst requests pending records
+- analyst approves or rejects a normalized record
+- service layer validates analyst role and tenant ownership
+- approve sets `approval_status=approved` and `locked_for_audit=True`
+- reject sets `approval_status=rejected`; record remains unlocked
+
+### Locking strategy
+
+Approval is the transition that makes a record audit-locked.
+
+- `pending` and `locked_for_audit=False` are mutable during ingestion/review.
+- `approved` and `locked_for_audit=True` are treated as immutable.
+- rejected records remain unlocked so downstream processes can still examine them.
+
+This is a practical lock model for an MVP: the system enforces immutability through service validation rather than complicated DB constraints.
 
 ---
 
 ## Auditability
 
-### AuditLog
+Audit records are explicit and append-only.
 
-**Append-only.** No update/delete in Django admin.
+### AuditLog design
 
-| Field | Purpose |
-|-------|---------|
-| `entity_type` | `data_source`, `raw_record`, `normalized_emission_record`, `tenant` |
-| `entity_id` | String PK (avoids GenericForeignKey) |
-| `action` | `created`, `approved`, `locked`, `upload_completed`, etc. |
-| `old_values` / `new_values` | JSON diff snapshots (changed fields only) |
-| `performed_by` / `performed_at` | Actor and timestamp |
+`AuditLog` stores:
 
-**Written explicitly** from ingestion pipeline and review services (Phase 3), not blanket `post_save` signals — easier to explain in code review.
+- `entity_type` and `entity_id` instead of foreign keys, to avoid cross-model coupling
+- `action` for lifecycle events
+- `old_values` and `new_values` as JSON diffs
+- `performed_by` and `performed_at`
 
-### Lock semantics
+The pipeline writes audit entries at key points: upload start/completion/failure and record approve/reject/lock.
 
-```
-pending + locked_for_audit=False  → editable by pipeline retry (MVP: no re-run)
-approved + locked_for_audit=True  → immutable
-rejected + locked_for_audit=False → stays rejected; re-upload creates new rows
-```
-
-`is_editable` property on model: `not locked_for_audit`.
+This makes it possible to trace a normalized record from source ingestion through analyst decision.
 
 ---
 
-## Scope categorization (by source)
+## Emission scope categorization
 
-| Source | Typical scope | Category examples |
-|--------|---------------|-------------------|
-| SAP fuel CSV | Scope 1 | `stationary_combustion`, fuel type from `Brennstoffart` |
-| Utility electricity | Scope 2 | `purchased_electricity` |
-| Corporate travel (mock API) | Scope 3 | `business_travel_air`, `hotel_stay`, `ground_transport` |
+The model uses discrete scope choices aligned with GHG protocol semantics:
 
-Parsers assign scope in Phase 3; model only stores the result.
+- `scope1`: direct emissions, primarily SAP fuel
+- `scope2`: indirect purchased electricity
+- `scope3`: travel and other downstream activities
 
----
-
-## Normalization flow (data perspective)
-
-```
-CSV/API row
-    → RawRecord.raw_payload
-    → ValidationEngine → validation_errors
-    → NormalizationEngine → normalized_unit, normalized_quantity, activity_date
-    → EmissionsCalculationService → emission_factor, calculated_emissions_kg_co2e
-    → NormalizedEmissionRecord (suspicious_flag from SuspiciousRules)
-```
-
-Emission factor is **copied onto the record** so historical recalculations do not silently change published numbers.
+Scope is assigned by parser logic, not by review or analysis. That keeps classification deterministic and consistent in the data model.
 
 ---
 
-## Review app (no tables)
+## Ingestion architecture
 
-`review` has no models. Workflow mutates `NormalizedEmissionRecord` and writes `AuditLog`. Keeps compliance logic out of generic CRUD.
+The ingestion path is synchronous and explicit.
+
+1. create `DataSource`
+2. parse rows into `RawRecord`
+3. validate each row
+4. normalize units and dates
+5. calculate emissions
+6. persist `NormalizedEmissionRecord`
+7. update `DataSource.processing_summary`
+8. emit audit log entries
+
+This design avoids queue infrastructure while preserving the full lineage of each row.
 
 ---
 
-## Seed commands
+## Tenant isolation
 
-```bash
-python manage.py migrate
-python manage.py seed_plant_codes
-python manage.py seed_demo_users
-```
+Tenant isolation is enforced at the application layer:
+
+- `request.user.tenant` scopes all relevant querysets
+- `DataSource` and `NormalizedEmissionRecord` always store tenant IDs
+- review endpoints only look up records within `request.user.tenant`
+
+The model intentionally does not store tenant on `AuditLog`; audit rows are scoped by the actor and entity IDs, not by tenant field.
 
 ---
 
-## Phase 2 deliverables checklist
+## Analyst review process
 
-- [x] Django project `config`
-- [x] Apps: `tenants`, `ingestion`, `emissions`, `review`, `audit`
-- [x] All models per assignment spec
-- [x] Indexes for review queue and audit timeline
-- [x] Admin registration (audit log read-only)
-- [x] `seed_plant_codes` and `seed_demo_users` commands
-- [ ] Migrations committed after `makemigrations` run locally
+Analyst users do not ingest data. Their workflow is:
+
+- inspect pending normalized records in `/api/review/pending/`
+- approve or reject individual records
+- approval sets an audit lock and emits approval + lock entries
+- rejection preserves unlocked state so the record can remain informational and potentially be corrected by a later ingestion
+
+This keeps the review process lightweight and makes the audit trail primary. Rejected records are not deleted or overwritten; they remain part of history.
+
+---
+
+## Engineering rationale
+
+- Multi-tenancy uses a single database to reduce operational overhead for MVP.
+- Source-of-truth tracking is explicit: `DataSource` → `RawRecord` → `NormalizedEmissionRecord`.
+- Auditing is explicit and service-driven, not implicit via signals.
+- Suspicious handling is a first-class field on normalized records, not a separate flag table.
+- Locking is stateful, not enforced by database-level immutability, which is appropriate for a small deployed prototype.
+- Emission scope is stored as a typed choice so downstream dashboards and filters can rely on consistent classification.
+
+The architecture is intentionally pragmatic: it keeps the platform understandable in code review while preserving the necessary lineage for compliance and tenant separation.
